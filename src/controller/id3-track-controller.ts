@@ -7,7 +7,11 @@ import {
 import { MetadataSchema } from '../types/demuxer';
 import { hexToArrayBuffer } from '../utils/hex';
 import { stringify } from '../utils/safe-json-stringify';
-import { createTrackNode, removeCuesInRange } from '../utils/texttrack-utils';
+import {
+  createTrackNode,
+  getCuesInRange,
+  removeCuesInRange,
+} from '../utils/texttrack-utils';
 import type { MediaFragment } from '../hls';
 import type Hls from '../hls';
 import type { DateRange } from '../loader/date-range';
@@ -29,6 +33,16 @@ declare global {
 }
 
 const MIN_CUE_DURATION = 0.25;
+
+// JavaScript-side snapshot of a metadata cue, kept so the payload survives
+// Safari stripping the custom `value` and `type` fields from the native cue
+export interface MetadataCueData {
+  cue: VTTCue | TextTrackCue;
+  startTime: number;
+  endTime: number;
+  type: MetadataSchema;
+  value: any;
+}
 
 function getCueClass(): typeof VTTCue | typeof TextTrackCue | undefined {
   if (typeof self === 'undefined') return undefined;
@@ -85,6 +99,14 @@ export class ID3TrackController implements ComponentAPI {
   > = {};
   private removeCues: boolean = true;
   private assetCue?: VTTCue | TextTrackCue;
+  // Retain the data of cues appended to the native TextTrack with
+  // JavaScript-side snapshots. Safari removes custom cue fields (such as
+  // `value` and `type`) from cues that are only referenced by the native
+  // TextTrack, leaving the entries in place with empty data. Holding the cue
+  // object itself is insufficient because the retained and native references
+  // are the same instance, so the payload is captured separately. Mirrors the
+  // cue retention used by TimelineController.
+  private cueData: Map<VTTCue | TextTrackCue, MetadataCueData> = new Map();
 
   constructor(hls) {
     this.hls = hls;
@@ -96,8 +118,19 @@ export class ID3TrackController implements ComponentAPI {
     this.id3Track = null;
     this.media = null;
     this.dateRangeCuesAppended = {};
+    this.cueData.clear();
     // @ts-ignore
     this.hls = this.onEventCueEnter = null;
+  }
+
+  /**
+   * Metadata cue data retained independently of the native TextTrack. Read
+   * from here to obtain cue payloads (`value`/`type`) even on Safari, where
+   * the native TextTrack may strip custom fields while keeping the cue entry
+   * in the track's cue list.
+   */
+  public get metadataCues(): MetadataCueData[] {
+    return Array.from(this.cueData.values());
   }
 
   private _registerListeners() {
@@ -163,6 +196,7 @@ export class ID3TrackController implements ComponentAPI {
       this.id3Track.remove();
       this.id3Track = null;
     }
+    this.cueData.clear();
     this.dateRangeCuesAppended = {};
   }
 
@@ -236,6 +270,15 @@ export class ID3TrackController implements ComponentAPI {
           );
           if (cue) {
             this.id3Track.track.addCue(cue);
+            // Snapshot the payload so it survives Safari clearing the custom
+            // `value` and `type` fields on the native cue object
+            this.cueData.set(cue, {
+              cue,
+              startTime,
+              endTime,
+              type,
+              value: frame,
+            });
           }
         }
       }
@@ -285,6 +328,19 @@ export class ID3TrackController implements ComponentAPI {
           ((cue as any).type === MetadataSchema.audioId3 &&
             enableID3MetadataCues) ||
           ((cue as any).type === MetadataSchema.emsg && enableEmsgMetadataCues);
+      }
+      // Retire the retained snapshots for the same cues that are removed
+      // from the native track so the cache does not grow without bound
+      const flushedCues = getCuesInRange(
+        id3Track.track.cues || [],
+        startOffset,
+        endOffset,
+      );
+      for (let i = flushedCues.length; i--; ) {
+        const cue = flushedCues[i];
+        if (predicate(cue)) {
+          this.cueData.delete(cue);
+        }
       }
       removeCuesInRange(id3Track.track, startOffset, endOffset, predicate);
     }
